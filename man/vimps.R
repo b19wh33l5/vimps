@@ -1,0 +1,501 @@
+#*******************************************************************************
+#
+# The functions to drive execution
+#
+#*******************************************************************************
+
+#*******************************************************************************
+# Default ML models used in simulation
+#*******************************************************************************
+
+# Generates predictions for samples using a full random forest tree. This is
+# utilized in prediction thresholds and evaluating performance on the full
+# set of variables.
+normal_model = function(df_t, df_T, formula, mtry=NULL, min.node.size=NULL) {
+  # Train model
+  model = ranger::ranger(as.formula(formula), data=df_t, probability=TRUE, mtry=mtry, min.node.size=min.node.size)
+  # Find out which column has probability predictions for class 1
+  class_1_col = match("1", colnames(model$predictions))
+  # Get the class 1 probability predictions for the testing data
+  yh = predict(model, data=df_T)$predictions[,class_1_col]
+  return(yh)
+}
+
+# Generates predictions for samples using just a tree one level deep. This is
+# utilized in evaluating performance when removing variables/domains or
+# replacing them with knockoffs
+one_tree_model = function(df_t, df_T, formula, mtry=NULL, min.node.size=NULL) {
+  # Train model
+  model = ranger::ranger(as.formula(formula), data=df_t, probability=TRUE, num.trees=1, mtry=mtry, min.node.size=min.node.size)
+  # Find out which column has probability predictions for class 1
+  class_1_col = match("1", colnames(model$predictions))
+  # Get the class 1 probability predictions for the testing data
+  yh = predict(model, data=df_T)$predictions[,class_1_col]
+  return(yh)
+}
+
+
+#*******************************************************************************
+# Use Yoden's J score to find the threshold to use
+#*******************************************************************************
+
+# We need to wrap the predictions in a try-catch block so we needed to create
+# an individual function for it because of how R syntax works
+calc_roc = function(yh, y) {
+  tryCatch(
+    {
+      pred = ROCR::prediction(yh, y)
+      return(pred)
+    },
+    error=function(e) {
+      return(NULL)
+    }
+  )
+}
+
+# Use x-fold validation with yoden's j score to determine the threshold for
+# classifying a sample as positive or negative
+calc_threshold = function(dat, dep_var, num_folds=10, model=normal_model, mtry=NULL, min.node.size=NULL) {
+  folds = caret::createFolds(dat[,dep_var], k=num_folds)
+  scores = c()
+
+  for(k in 1:num_folds) {
+    # Get our train and test splits for a given fold
+    df_t = dat[-folds[[k]], ]
+    df_T = dat[folds[[k]], ]
+
+    # Train model and get results
+    formula = paste(dep_var, " ~ .")
+    yh = model(df_t, df_T, formula, mtry, min.node.size)
+
+    # Get our tpr, fpr, and threshold values
+    pred = calc_roc(yh, df_T[,dep_var])
+
+    # Catch case where test split has no positive outcomes
+    if(is.null(pred)) {
+      next
+    }
+
+    perf = ROCR::performance(pred, "tpr", "fpr")
+    tpr = perf@y.values[[1]]
+    fpr = perf@x.values[[1]]
+    thresholds = perf@alpha.values[[1]]
+
+    # Calc yoden's J
+    j_scores = tpr-fpr
+    max_idx = which(j_scores==max(j_scores))
+    # Take the min because sometimes we can have infinity as one of the max vals
+    yoden_j = min(thresholds[max_idx])
+    scores = append(scores, yoden_j)
+  }
+
+  print("Thresholds for each k fold: ")
+  print(scores)
+
+  # Get the average score and return it
+  threshold = list(avg = mean(scores), all = scores)
+  print("Average threshold: ")
+  print(threshold$avg)
+
+  return (threshold)
+}
+
+
+#*******************************************************************************
+# Calc the model metrics using all the variables
+#*******************************************************************************
+
+calc_var_metrics = function(dat, dep_var, threshold, iterations=500, model=normal_model, mtry=NULL, min.node.size=NULL) {
+  preds = matrix(nrow=0, ncol=nrow(dat))
+
+  for(i in 1:iterations) {
+    # Do bootstrap resampling
+    dat_bs = dat[sample(nrow(dat), replace=TRUE),]
+
+    # Create stratified train/test splits w/o VOI
+    idx_tr = caret::createDataPartition(dat_bs[,dep_var], p=0.8, list=FALSE)
+    df_t = dat_bs[idx_tr,]
+    df_T= dat_bs[-idx_tr,]
+
+    # Train model and get results
+    formula = paste(dep_var, " ~ .")
+    yh = model(df_t, df_T, formula, mtry, min.node.size)
+
+    # Create vector to store predictions
+    vec = rep(NA, nrow(dat))
+    rows = as.integer(rownames(df_T))
+
+    # Collect the results
+    for(i in 1:length(rows)) {
+      pred = yh[i]
+      row_idx = rows[i]
+      vec[row_idx] = pred
+    }
+
+    # Add the results to the matrix
+    preds = rbind(preds, vec)
+  }
+
+  # Get the average prediction for each variable
+  mus = colMeans(preds, na.rm=TRUE)
+  # Label each sample positive/negative on cut off
+  yh = mus > threshold
+
+  # Computer our confusion matrix
+  mtx = table(dat[, dep_var], yh)
+  tn = mtx[1,1]
+  fp = mtx[1,2]
+  fn = mtx[2,1]
+  tp = mtx[2,2]
+
+  # Compute the metrics and save them
+  acc = (tp+tn)/length(dat[, dep_var])
+  sens = tp/(tp+fn)
+  spec = tn/(tn+fp)
+
+  print(paste("Accuracy:", acc))
+  print(paste("Sensitivity:", sens))
+  print(paste("Specificity:", spec))
+
+  return (list(acc=acc, sens=sens, spec=spec))
+}
+
+
+#*******************************************************************************
+# Calc knock-offs
+#*******************************************************************************
+
+# Wrapper script for client-side operation
+gen_kos = function(dat, dep_var, iterations=100, ko_path=NULL) {
+  # Set-up the folder to store the KO values
+  if(is.null(ko_path)) {
+    ko_path = paste(getwd(), "kos/", sep="/")
+  }
+  if(dir.exists(ko_path)) {
+    unlink(ko_path, recursive=TRUE)
+  }
+  dir.create(ko_path)
+
+  print(paste("Creating", iterations, "kos in", ko_path))
+
+  for(i in 1:iterations) {
+    gen_ko(dat, dep_var, i, ko_path)
+  }
+}
+
+# regular script for server-side operation
+gen_ko = function(dat, dep_var, iteration, ko_path) {
+  # Set-up data in format needed for knock-off package
+  X = dat[,!(names(dat) %in% c(dep_var))]
+  X = data.matrix(X)
+
+  # Create knock-off variables
+  Xk = knockoff::create.second_order(X)
+
+  # Store results to disk
+  fout = paste(ko_path, "ko_set_", iteration, ".csv", sep="")
+  write.table(Xk, fout, row.names=FALSE, col.names=TRUE, sep=",")
+}
+
+
+#*******************************************************************************
+# Calc KO Probs
+#*******************************************************************************
+
+# Wrapper function for client-side operation
+calc_ko_probs = function(dat, dep_var, doms, ko_path=NULL, results_path=NULL, iterations=500, model=one_tree_model, mtry=NULL, min.node.size=NULL) {
+  print(paste("Calculating ", iterations, " rounds of probabilities using knockoffs"))
+
+  # Set default ko_path if none provided
+  if(is.null(ko_path)) {
+    ko_path = paste(getwd(), "kos/", sep="/")
+  }
+
+  num_kos=length(list.files(ko_path))
+
+  # Set-up the folder to store the results
+  if(is.null(results_path)) {
+    results_path = paste(getwd(), "results/", sep="/")
+  }
+  if(dir.exists(results_path)) {
+    unlink(results_path, recursive=TRUE)
+  }
+  dir.create(results_path)
+
+  num_vois = length(unique(doms$domain))
+
+  for(i in 1:num_vois) {
+    calc_ko_prob(dat, doms, ko_path, results_path, i, dep_var, iterations, num_kos, model)
+  }
+}
+
+calc_ko_prob = function(dat, doms, ko_path, results_path, voi_idx, dep_var, iterations, num_kos, model, mtry=NULL, min.node.size=NULL) {
+  # Only keep the variables we have in our dictionary
+  vars = c(doms$variable, dep_var)
+  dat = dat[,names(dat) %in% vars]
+
+  # Get our domains and VOIs
+  dom = unique(doms$domain)[voi_idx]
+  vois = doms[doms$domain==dom,]$var
+
+  # Set up our storage for the predicted probabilities
+  ko_pred = matrix(nrow=0, ncol=nrow(dat))
+
+  for(i in 1:iterations) {
+    # Do bootstrap resampling
+    dat_bs = dat[sample(nrow(dat), replace=TRUE),]
+
+    # Create knock-off variables and assign knock-off over top regular VOI
+    ko_file = paste(ko_path, "/ko_set_", sample.int(num_kos, 1, replace=TRUE), ".csv", sep="")
+    Xk = read.csv(ko_file)
+    dat_bs[,vois] = Xk[,vois]
+
+    # Create stratified train/test splits w/ knock-off var
+    idx_tr = caret::createDataPartition(dat_bs[,dep_var], p=0.8, list=FALSE)
+    df_t = dat_bs[idx_tr,]
+    df_T= dat_bs[-idx_tr,]
+
+    # Train model and get results
+    formula = paste(dep_var, " ~ .")
+    yh = model(df_t, df_T, formula, mtry, min.node.size)
+
+    # Create vector to store predictions
+    vec = rep(NA, nrow(dat))
+    rows = as.integer(rownames(df_T))
+
+    for(i in 1:length(rows)) {
+      pred = yh[i]
+      row_idx = rows[i]
+      vec[row_idx] = pred
+    }
+
+    # Add the results to the matrix
+    ko_pred = rbind(ko_pred, vec)
+  }
+
+  fout = paste(results_path, dom, "_ko.csv", sep="")
+  write.table(ko_pred, fout, row.names=FALSE, col.names=FALSE, sep=",")
+}
+
+
+#*******************************************************************************
+# Calc dom Probs
+#*******************************************************************************
+
+# Client-side wrapper function
+calc_dom_probs = function(dat, dep_var, doms, results_path=NULL, iterations=500, model=one_tree_model, mtry=NULL, min.node.size=NULL) {
+  print(paste("Calculating", iterations, "rounds of probabilities by domain removal"))
+
+  # Set-up the folder to store the results
+  if(is.null(results_path)) {
+    results_path = paste(getwd(), "results/", sep="/")
+  }
+  if(dir.exists(results_path)) {
+    unlink(results_path, recursive=TRUE)
+  }
+  dir.create(results_path)
+
+  num_vois = length(unique(doms$domain))
+
+  for(i in 1:num_vois) {
+    calc_dom_prob(dat, doms, results_path, i, dep_var, iterations, model)
+  }
+}
+
+calc_dom_prob = function(dat, doms, results_path, voi_idx, dep_var, iterations, model, mtry=NULL, min.node.size=NULL) {
+  # Only keep the variables we have in our dictionary
+  vars = c(doms$variable, dep_var)
+  dat = dat[,names(dat) %in% vars]
+
+  # Get our domains and VOIs
+  dom = unique(doms$domain)[voi_idx]
+  vois = doms[doms$domain==dom,]$var
+
+  # Set up our storage for the predicted probabilities
+  dom_pred = matrix(nrow=0, ncol=nrow(dat))
+
+  for(i in 1:iterations) {
+    # Do bootstrap resampling
+    dat_bs = dat[sample(nrow(dat), replace=TRUE),]
+
+    # Remove the variable of interest
+    dat_bs = dat_bs[, !(names(dat_bs) %in% vois)]
+
+    # Create stratified train/test splits w/ knock-off var
+    idx_tr = caret::createDataPartition(dat_bs[,dep_var], p=0.8, list=FALSE)
+    df_t = dat_bs[idx_tr,]
+    df_T= dat_bs[-idx_tr,]
+
+    # Train model and get results
+    formula = paste(dep_var, " ~ .")
+    yh = model(df_t, df_T, formula, mtry, min.node.size)
+
+    # Create vector to store predictions
+    vec = rep(NA, nrow(dat))
+    rows = as.integer(rownames(df_T))
+
+    for(i in 1:length(rows)) {
+      pred = yh[i]
+      row_idx = rows[i]
+      vec[row_idx] = pred
+    }
+
+    # Add the results to the matrix
+    dom_pred = rbind(dom_pred, vec)
+  }
+
+  fout = paste(results_path, dom, "_dom.csv", sep="")
+  write.table(dom_pred, fout, row.names=FALSE, col.names=FALSE, sep=",")
+}
+
+
+#*******************************************************************************
+# Calc Metrics
+#*******************************************************************************
+
+calc_metrics = function(dat, dep_var, cutoff, test_type, metrics, input_path=NULL, output_file=NULL) {
+  print("Calculating variable importance")
+
+  if(is.null(input_path)) {
+    input_path = paste(getwd(), "results/", sep="/")
+  }
+
+  if(is.null(output_file)) {
+    output_file = paste(getwd(), "/", test_type, "_output.csv", sep="")
+  }
+
+  y = dat[,dep_var]
+
+  # Get our list of result files
+  pattern = paste("*_", test_type, ".csv", sep="")
+  files = list.files(input_path, pattern=pattern)
+
+  results = matrix(nrow=0, ncol=7)
+
+  # Iterate over our result files
+  for (i in 1:length(files)) {
+    # Open our results
+    file_name = paste(input_path, files[i], sep="")
+    df = read.csv(file_name, stringsAsFactors=FALSE, header=FALSE)
+
+    # Compute the predictions of the results via the cutoff
+    mus = colMeans(df, na.rm=TRUE)
+    yh = mus > cutoff
+
+    # Computer our confusion matrix
+    mtx = table(y, yh)
+    tn = mtx[1,1]
+    fp = mtx[1,2]
+    fn = mtx[2,1]
+    tp = mtx[2,2]
+
+    # Compute the metrics and save them
+    acc = (tp+tn)/length(y)
+    sens = tp/(tp+fn)
+    spec = tn/(tn+fp)
+
+    var_name = gsub(substr(pattern, 2, nchar(pattern)), "", files[i])
+    results = rbind(results, c(var_name, acc, sens, spec, metrics$acc-acc, metrics$sens-sens, metrics$spec-spec))
+  }
+
+  # Convert results to Dataframe and save to disk
+  results = data.frame(results)
+  colnames(results) = c("variable", "acc", "sens", "spec", "delta_acc", "delta_sens", "delta_spec")
+  write.csv(results, output_file, row.names=FALSE)
+
+  return(results)
+}
+
+
+#*******************************************************************************
+# Run entire process
+#*******************************************************************************
+
+#' Calculate variable importance for a dataset
+#'
+#' @export
+calc_vimps = function(dat, dep_var, doms, calc_ko=TRUE, calc_dom=FALSE,
+                      num_folds=10, num_kos=100, model_all=normal_model,
+                      model_subset=one_tree_model, mtry=NULL, min.node.size=NULL,
+                      iterations=500, ko_path=NULL, results_path=NULL,
+                      output_file_ko=NULL, output_file_dom=NULL) {
+  results = list()
+
+  print("")
+  print("#*******************************************************************************")
+  print("# Calculating thresholds")
+  print("#*******************************************************************************")
+  threshold = calc_threshold(dat, dep_var, num_folds, model_all, mtry, min.node.size)
+  results[['thresholds']] = threshold
+
+  print("")
+  print("#*******************************************************************************")
+  print("# Calculating variable metrics")
+  print("#*******************************************************************************")
+  metrics = calc_var_metrics(dat, dep_var, threshold$avg, iterations, model_all, mtry, min.node.size)
+  results[['metrics']] = metrics
+
+  print("")
+  print("#*******************************************************************************")
+  print("# Generating knockoff variables")
+  print("#*******************************************************************************")
+  gen_kos(dat, dep_var, num_kos, ko_path)
+
+  if(calc_ko) {
+    print("")
+    print("#*******************************************************************************")
+    print("# Calculating knockoff probabilities")
+    print("#*******************************************************************************")
+    calc_ko_probs(dat, dep_var, doms, ko_path, results_path, iterations, model_subset, mtry, min.node.size)
+
+    print("")
+    print("#*******************************************************************************")
+    print("# Calculating knockoff metrics")
+    print("#*******************************************************************************")
+    results_ko = calc_metrics(dat, dep_var, threshold$avg, "ko", metrics, results_path, output_file_ko)
+    results[['results_ko']] = results_ko
+    results_ko = results_ko[c("variable", "delta_acc")]
+    colnames(results_ko) = c("variable", "importance")
+    results[['ko_importance']] = results_ko
+  }
+
+  if(calc_dom) {
+    print("")
+    print("#*******************************************************************************")
+    print("# Calculating domain probabilities")
+    print("#*******************************************************************************")
+    calc_dom_probs(dat, dep_var, doms, results_path, iterations, model_subset, mtry, min.node.size)
+
+    print("")
+    print("#*******************************************************************************")
+    print("# Calculating domain metrics")
+    print("#*******************************************************************************")
+    results_dom = calc_metrics(dat, dep_var, threshold$avg, "dom", metrics, results_path, output_file_dom)
+    results[['results_dom']] = results_dom
+    results_dom = results_dom[c("variable", "delta_acc")]
+    colnames(results_dom) = c("variable", "importance")
+    results[['dom_importance']] = results_dom
+  }
+
+  return(results)
+}
+
+
+#*******************************************************************************
+# Visualize Results
+#*******************************************************************************
+
+#' Visualize results of the variable importance
+#'
+#' @export
+graph_results = function(results) {
+  df = results$ko_importance
+  df$importance = as.numeric(df$importance)
+
+  ggplot2::ggplot(data=df, ggplot2::aes(x=importance, y=reorder(variable, importance))) +
+    ggplot2::geom_point() +
+    ggplot2::theme_bw() +
+    ggplot2::xlab("KO Domain Variable Importance") +
+    ggplot2::ylab("")
+}
+
