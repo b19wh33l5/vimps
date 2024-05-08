@@ -1,11 +1,19 @@
 Package: VIMPS
-Type: Package
-Title: What the Package Does (Title Case)
-Version: 0.1.0
-Author: Who wrote it
-Maintainer: The package maintainer <yourself@somewhere.net>
-Description: More about what it does (maybe more than one line)
-    Use four spaces when indenting paragraphs within the Description.
-License: What license is it under?
+Title: Calculate variable importance with knock off variables
+Version: 0.0.0.9000
+Author: Meredith Wallace <lotzmj@upmc.edu>
+Maintainer: Meredith Wallace <lotzmj@upmc.edu>
+Authors@R: 
+    person("Meredith", "Wallace", , "lotzmj@upmc.edu", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0003-3951-890X"))
+Description: The variable importance is calculated using knock off variables. Then output can be provided in numerical and graphical form.
+License: MIT + file LICENSE
 Encoding: UTF-8
-LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.2.3
+Imports:
+  caret,
+  ggplot2,
+  ranger,
+  knockoff,
+  ROCR

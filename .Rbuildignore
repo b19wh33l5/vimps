@@ -1,2 +1,3 @@
-^.*\.Rproj$
+^VIMPS\.Rproj$
 ^\.Rproj\.user$
+^cran-comments\.md$
